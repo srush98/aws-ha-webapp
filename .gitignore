@@ -1,0 +1,8 @@
+# Terraform: state holds secrets, never commit it
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+crash.log
+# Maven build output
+target/
