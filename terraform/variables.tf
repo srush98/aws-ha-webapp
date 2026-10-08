@@ -8,3 +8,6 @@ variable "app_cidrs" { default = ["10.1.11.0/24", "10.1.12.0/24"] }
 variable "db_cidrs" { default = ["10.1.21.0/24", "10.1.22.0/24"] }
 
 variable "repo_url" { default = "https://github.com/srush98/aws-ha-webapp.git" }
+
+variable "domain_name" { default = "srushti.site" }
+variable "subdomain" { default = "terraform" }
