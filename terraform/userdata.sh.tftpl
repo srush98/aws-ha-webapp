@@ -1,0 +1,54 @@
+#!/bin/bash
+set -euo pipefail   # no -x: the DB password must never reach the logs
+
+dnf install -y java-17-amazon-corretto-devel git mariadb105 tar
+
+# Tomcat 9 (pinned), running as an unprivileged user
+useradd -r -M -d /opt/tomcat -s /sbin/nologin tomcat
+mkdir -p /opt/tomcat
+curl -fsSL https://archive.apache.org/dist/tomcat/tomcat-9/v9.0.98/bin/apache-tomcat-9.0.98.tar.gz | tar xz -C /opt/tomcat --strip-components=1
+rm -rf /opt/tomcat/webapps/*
+
+# Build the WAR from the repository
+curl -fsSL https://archive.apache.org/dist/maven/maven-3/3.9.9/binaries/apache-maven-3.9.9-bin.tar.gz | tar xz -C /opt
+git clone ${repo_url} /tmp/app
+cd /tmp/app && /opt/apache-maven-3.9.9/bin/mvn -q -B package
+cp target/LoginWebApp.war /opt/tomcat/webapps/ROOT.war
+chown -R tomcat:tomcat /opt/tomcat
+
+# Database settings from Parameter Store (secret fetched at boot, never in user data)
+get() { aws ssm get-parameter --region ${region} --name "$1" --with-decryption --query Parameter.Value --output text; }
+DB_URL=$(get /${prefix}/db/url)
+DB_USER=$(get /${prefix}/db/user)
+DB_PASSWORD=$(get /${prefix}/db/password)
+
+cat > /etc/tomcat-db.env <<EOF
+DB_URL=$DB_URL
+DB_USER=$DB_USER
+DB_PASSWORD=$DB_PASSWORD
+EOF
+chown root:tomcat /etc/tomcat-db.env && chmod 640 /etc/tomcat-db.env
+
+# Create the schema if missing (idempotent); never block Tomcat if this fails
+MYSQL_PWD="$DB_PASSWORD" mysql -h ${db_host} -u "$DB_USER" --ssl jwt < /tmp/app/db/schema.sql \
+  || echo "WARNING: schema step failed"
+
+# Tomcat as a systemd service
+cat > /etc/systemd/system/tomcat.service <<'EOF'
+[Unit]
+Description=Apache Tomcat 9
+After=network.target
+[Service]
+Type=forking
+User=tomcat
+Group=tomcat
+EnvironmentFile=/etc/tomcat-db.env
+Environment=CATALINA_PID=/opt/tomcat/temp/tomcat.pid
+PIDFile=/opt/tomcat/temp/tomcat.pid
+ExecStart=/opt/tomcat/bin/startup.sh
+ExecStop=/opt/tomcat/bin/shutdown.sh
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl daemon-reload
+systemctl enable --now tomcat
