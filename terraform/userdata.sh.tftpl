@@ -52,3 +52,52 @@ WantedBy=multi-user.target
 EOF
 systemctl daemon-reload
 systemctl enable --now tomcat
+
+# ---- Ship Tomcat logs to S3 every 5 minutes, and once more at shutdown ----
+cat > /usr/local/bin/ship-tomcat-logs.sh <<'EOF'
+#!/bin/bash
+set -euo pipefail
+BUCKET="${log_bucket}"
+TOKEN=$(curl -sf -X PUT http://169.254.169.254/latest/api/token -H "X-aws-ec2-metadata-token-ttl-seconds: 300")
+ID=$(curl -sf -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
+aws s3 sync /opt/tomcat/logs "s3://$BUCKET/tomcat/$ID/" --region ${region} --only-show-errors
+EOF
+chmod 750 /usr/local/bin/ship-tomcat-logs.sh
+
+cat > /etc/systemd/system/tomcat-logs.service <<'EOF'
+[Unit]
+Description=Ship Tomcat logs to S3
+After=network-online.target
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/ship-tomcat-logs.sh
+EOF
+
+cat > /etc/systemd/system/tomcat-logs.timer <<'EOF'
+[Unit]
+Description=Ship Tomcat logs to S3 every 5 minutes
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=5min
+Persistent=true
+[Install]
+WantedBy=timers.target
+EOF
+
+cat > /etc/systemd/system/tomcat-logs-final.service <<'EOF'
+[Unit]
+Description=Final Tomcat log upload at shutdown
+After=network-online.target
+Wants=network-online.target
+Before=tomcat.service
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/true
+ExecStop=/usr/local/bin/ship-tomcat-logs.sh
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now tomcat-logs.timer tomcat-logs-final.service
