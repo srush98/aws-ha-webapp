@@ -1,3 +1,7 @@
+# ---------- DB connection settings in SSM Parameter Store ----------
+# App servers read these at boot (see iam.tf: ssm:GetParameter on /<name>/db/*)
+
+# JDBC URL; TLS is required for the connection to RDS
 resource "aws_ssm_parameter" "db_url" {
   name  = "/${var.name}/db/url"
   type  = "String"
@@ -10,6 +14,7 @@ resource "aws_ssm_parameter" "db_user" {
   value = aws_db_instance.main.username
 }
 
+# Generated password from database.tf
 resource "aws_ssm_parameter" "db_password" {
   name  = "/${var.name}/db/password"
   type  = "SecureString" # encrypted with the AWS-managed KMS key

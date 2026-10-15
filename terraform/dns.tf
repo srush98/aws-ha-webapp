@@ -1,3 +1,8 @@
+# =====================================================================
+# DNS and TLS: Route 53 record, ACM certificate, HTTPS listener
+# =====================================================================
+
+# Full hostname of the app, e.g. terraform.srushti.site
 locals {
   app_fqdn = "${var.subdomain}.${var.domain_name}"
 }
@@ -8,6 +13,8 @@ data "aws_route53_zone" "main" {
   private_zone = false
 }
 
+# ---------- ACM certificate ----------
+# Validated via DNS; replaced certificate is created before the old one is removed
 resource "aws_acm_certificate" "app" {
   domain_name       = local.app_fqdn
   validation_method = "DNS"
@@ -35,7 +42,7 @@ resource "aws_route53_record" "cert_validation" {
   type            = each.value.type
   records         = [each.value.record]
   ttl             = 60
-  allow_overwrite = true
+  allow_overwrite = true # reuse the record if it already exists
 }
 
 # Waits until ACM reports the certificate as Issued
@@ -44,12 +51,14 @@ resource "aws_acm_certificate_validation" "app" {
   validation_record_fqdns = [for r in aws_route53_record.cert_validation : r.fqdn]
 }
 
+# ---------- HTTPS listener ----------
+# Terminates TLS (1.2/1.3 only) and forwards to the app target group
 resource "aws_lb_listener" "https" {
   load_balancer_arn = aws_lb.app.arn
   port              = 443
   protocol          = "HTTPS"
   ssl_policy        = "ELBSecurityPolicy-TLS13-1-2-2021-06"
-  certificate_arn   = aws_acm_certificate_validation.app.certificate_arn
+  certificate_arn   = aws_acm_certificate_validation.app.certificate_arn # waits for validation
 
   default_action {
     type             = "forward"
@@ -57,6 +66,7 @@ resource "aws_lb_listener" "https" {
   }
 }
 
+# ---------- App DNS record ----------
 # terraform.srushti.site -> Terraform ALB
 resource "aws_route53_record" "app" {
   zone_id = data.aws_route53_zone.main.zone_id

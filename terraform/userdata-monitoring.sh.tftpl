@@ -1,0 +1,252 @@
+#!/bin/bash
+set -euo pipefail   # monitoring IS this server's job: fail loudly (and no -x: secret below)
+
+PROM_VER="${prometheus_version}"
+AM_VER="${alertmanager_version}"
+BB_VER="${blackbox_version}"
+
+# Download a Prometheus-project release, verify its SHA-256, extract it
+gh_install() {
+  local proj=$1 ver=$2
+  local base="https://github.com/prometheus/$proj/releases/download/v$ver"
+  curl -fsSLO "$base/$proj-$ver.linux-amd64.tar.gz"
+  curl -fsSL -o "$proj-sha256sums.txt" "$base/sha256sums.txt"
+  sha256sum -c --ignore-missing "$proj-sha256sums.txt"
+  tar xzf "$proj-$ver.linux-amd64.tar.gz"
+  rm -f "$proj-$ver.linux-amd64.tar.gz"
+}
+
+WORKDIR=/var/tmp/monitoring-install
+mkdir -p "$WORKDIR"
+cd "$WORKDIR"
+gh_install prometheus "$PROM_VER"
+install -m 0755 prometheus-$PROM_VER.linux-amd64/{prometheus,promtool} /usr/local/bin/
+gh_install alertmanager "$AM_VER"
+install -m 0755 alertmanager-$AM_VER.linux-amd64/{alertmanager,amtool} /usr/local/bin/
+gh_install blackbox_exporter "$BB_VER"
+install -m 0755 blackbox_exporter-$BB_VER.linux-amd64/blackbox_exporter /usr/local/bin/
+
+# ---- Users and directories ----
+for u in prometheus alertmanager blackbox_exporter; do useradd -r -M -s /sbin/nologin "$u"; done
+mkdir -p /etc/prometheus/rules /etc/blackbox_exporter /var/lib/prometheus /var/lib/alertmanager
+chown prometheus:prometheus /var/lib/prometheus
+chown alertmanager:alertmanager /var/lib/alertmanager
+install -d -o root -g alertmanager -m 0750 /etc/alertmanager
+
+# ---- Slack webhook: fetched at boot, readable only by alertmanager, never in user data ----
+(umask 027; aws ssm get-parameter --region ${region} --name "/${name}/monitoring/slack_webhook" \
+   --with-decryption --query Parameter.Value --output text | tr -d '\n' > /etc/alertmanager/slack_webhook)
+chown root:alertmanager /etc/alertmanager/slack_webhook
+grep -q '^https://hooks.slack.com/services/' /etc/alertmanager/slack_webhook \
+  || { echo "ERROR: Slack webhook in Parameter Store is malformed" >&2; exit 1; }
+
+# ---- Prometheus ----
+cat > /etc/prometheus/prometheus.yml <<'EOF'
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  - /etc/prometheus/rules/*.yml
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ['127.0.0.1:9093']
+
+scrape_configs:
+  - job_name: prometheus
+    static_configs:
+      - targets: ['localhost:9090']
+
+  - job_name: node
+    ec2_sd_configs:
+      - region: ${region}
+        port: 9100
+        filters:
+          - name: tag:Name
+            values: ['${name}-app']
+          - name: instance-state-name
+            values: ['running']
+    relabel_configs:
+      - source_labels: [__meta_ec2_instance_id]
+        target_label: instance
+      - source_labels: [__meta_ec2_availability_zone]
+        target_label: az
+
+  # Probe the public site like a real user: DNS -> NAT -> internet -> ALB -> Tomcat
+  - job_name: blackbox_https
+    scrape_interval: 60s
+    metrics_path: /probe
+    params:
+      module: [https_2xx]
+    static_configs:
+      - targets: ['https://${app_fqdn}']
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__param_target]
+        target_label: instance
+      - target_label: __address__
+        replacement: 127.0.0.1:9115
+EOF
+
+cat > /etc/prometheus/rules/alerts.yml <<'EOF'
+groups:
+  - name: tf-webapp
+    rules:
+      - alert: InstanceDown
+        expr: up{job="node"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "App instance {{ $labels.instance }} is down"
+          description: "node_exporter on {{ $labels.instance }} ({{ $labels.az }}) has not answered for 1 minute."
+
+      - alert: HighCpu
+        expr: 100 * (1 - avg by (instance, az) (rate(node_cpu_seconds_total{mode="idle"}[5m]))) > ${cpu_threshold}
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High CPU on {{ $labels.instance }}"
+          description: "CPU is {{ $value | humanize }}% (threshold ${cpu_threshold}%) for 5 minutes."
+
+      - alert: DiskSpaceHigh
+        expr: 100 * (1 - node_filesystem_avail_bytes{mountpoint="/"} / node_filesystem_size_bytes{mountpoint="/"}) > ${disk_threshold}
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Root disk filling up on {{ $labels.instance }}"
+          description: "{{ $value | humanize }}% used (threshold ${disk_threshold}%)."
+
+      - alert: SslCertExpiringSoon
+        expr: (probe_ssl_earliest_cert_expiry{job="blackbox_https"} - time()) / 86400 < ${ssl_days}
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "TLS certificate for {{ $labels.instance }} expires soon"
+          description: "{{ $value | humanize }} days left (threshold ${ssl_days}). ACM should auto-renew: check its status."
+
+      # Companion to the SSL alert: if the probe fails, the expiry metric disappears
+      - alert: EndpointDown
+        expr: probe_success{job="blackbox_https"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.instance }} is unreachable"
+          description: "The HTTPS probe has failed for 2 minutes (DNS, TLS, ALB or app)."
+EOF
+promtool check config /etc/prometheus/prometheus.yml   # also validates the rule file
+
+# ---- Alertmanager ----
+cat > /etc/alertmanager/alertmanager.yml <<'EOF'
+route:
+  receiver: slack
+  group_by: ['alertname']
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+
+receivers:
+  - name: slack
+    slack_configs:
+      - api_url_file: /etc/alertmanager/slack_webhook
+        send_resolved: true
+        title: '{{ if eq .Status "firing" }}:rotating_light: FIRING{{ else }}:white_check_mark: RESOLVED{{ end }} - {{ .CommonLabels.alertname }}'
+        text: |-
+          {{ range .Alerts }}*{{ .Annotations.summary }}*
+          {{ .Annotations.description }}
+          {{ end }}
+EOF
+chown root:alertmanager /etc/alertmanager/alertmanager.yml
+chmod 640 /etc/alertmanager/alertmanager.yml
+amtool check-config /etc/alertmanager/alertmanager.yml
+
+# ---- Blackbox exporter ----
+cat > /etc/blackbox_exporter/blackbox.yml <<'EOF'
+modules:
+  https_2xx:
+    prober: http
+    timeout: 10s
+    http:
+      preferred_ip_protocol: ip4
+      fail_if_not_ssl: true
+      valid_status_codes: [200]
+EOF
+
+# ---- systemd services (all bound to localhost) ----
+cat > /etc/systemd/system/blackbox_exporter.service <<'EOF'
+[Unit]
+Description=Prometheus Blackbox Exporter
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=blackbox_exporter
+Group=blackbox_exporter
+ExecStart=/usr/local/bin/blackbox_exporter \
+  --config.file=/etc/blackbox_exporter/blackbox.yml \
+  --web.listen-address=127.0.0.1:9115
+Restart=on-failure
+NoNewPrivileges=yes
+ProtectSystem=strict
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+cat > /etc/systemd/system/alertmanager.service <<'EOF'
+[Unit]
+Description=Prometheus Alertmanager
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=alertmanager
+Group=alertmanager
+ExecStart=/usr/local/bin/alertmanager \
+  --config.file=/etc/alertmanager/alertmanager.yml \
+  --storage.path=/var/lib/alertmanager \
+  --web.listen-address=127.0.0.1:9093 \
+  --cluster.listen-address=
+Restart=on-failure
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/alertmanager
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+cat > /etc/systemd/system/prometheus.service <<'EOF'
+[Unit]
+Description=Prometheus
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=prometheus
+Group=prometheus
+ExecStart=/usr/local/bin/prometheus \
+  --config.file=/etc/prometheus/prometheus.yml \
+  --storage.tsdb.path=/var/lib/prometheus \
+  --storage.tsdb.retention.time=7d \
+  --web.listen-address=127.0.0.1:9090
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/prometheus
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now blackbox_exporter alertmanager prometheus
+cd / && rm -rf "$WORKDIR"  

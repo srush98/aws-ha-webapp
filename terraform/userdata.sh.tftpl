@@ -101,3 +101,39 @@ EOF
 
 systemctl daemon-reload
 systemctl enable --now tomcat-logs.timer tomcat-logs-final.service
+
+# ---- Prometheus node_exporter: host metrics on :9100. Must never block the app. ----
+NE_VER="${node_exporter_version}"
+NE_URL="https://github.com/prometheus/node_exporter/releases/download/v$NE_VER"
+
+# Every step chained with && because bash ignores `set -e` inside `func || ...`
+install_node_exporter() {
+  cd /tmp &&
+  curl -fsSLO "$NE_URL/node_exporter-$NE_VER.linux-amd64.tar.gz" &&
+  curl -fsSL -o ne-sha256sums.txt "$NE_URL/sha256sums.txt" &&
+  sha256sum -c --ignore-missing ne-sha256sums.txt &&
+  tar xzf "node_exporter-$NE_VER.linux-amd64.tar.gz" &&
+  install -m 0755 "node_exporter-$NE_VER.linux-amd64/node_exporter" /usr/local/bin/node_exporter &&
+  useradd -r -M -s /sbin/nologin node_exporter
+}
+
+cat > /etc/systemd/system/node_exporter.service <<'EOF'
+[Unit]
+Description=Prometheus Node Exporter
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=node_exporter
+Group=node_exporter
+ExecStart=/usr/local/bin/node_exporter --web.listen-address=:9100
+Restart=on-failure
+NoNewPrivileges=yes
+ProtectSystem=strict
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+install_node_exporter && systemctl daemon-reload && systemctl enable --now node_exporter \
+  || echo "WARNING: node_exporter install failed; Prometheus will show this target as down"

@@ -1,3 +1,7 @@
+# =====================================================================
+# Compute: app servers in an Auto Scaling group behind the ALB
+# =====================================================================
+
 # Latest Amazon Linux 2023 (x86) published by Amazon
 data "aws_ami" "al2023" {
   most_recent = true
@@ -8,6 +12,8 @@ data "aws_ami" "al2023" {
   }
 }
 
+# ---------- Launch template ----------
+# Blueprint for every app server; a change triggers an instance refresh
 resource "aws_launch_template" "app" {
   name                   = "${var.name}-app-lt"
   image_id               = data.aws_ami.al2023.id
@@ -23,20 +29,25 @@ resource "aws_launch_template" "app" {
     http_tokens = "required" # IMDSv2 only
   }
 
+  # Boot script: installs Tomcat, deploys the app, ships logs, runs node_exporter
   user_data = base64encode(templatefile("${path.module}/userdata.sh.tftpl", {
-    repo_url   = var.repo_url
-    region     = var.region
-    prefix     = var.name
-    db_host    = aws_db_instance.main.address
-    log_bucket = aws_s3_bucket.logs.bucket
+    repo_url              = var.repo_url
+    region                = var.region
+    prefix                = var.name
+    db_host               = aws_db_instance.main.address
+    log_bucket            = aws_s3_bucket.logs.bucket
+    node_exporter_version = var.node_exporter_version
   }))
 
+  # Instance tags; Name = <name>-app is what Prometheus uses to discover targets
   tag_specifications {
     resource_type = "instance"
     tags          = { Name = "${var.name}-app", Project = "srushti-ha-webapp", ManagedBy = "Terraform" }
   }
 }
 
+# ---------- Auto Scaling group ----------
+# 2-4 instances across both private app subnets; ELB health checks replace bad instances
 resource "aws_autoscaling_group" "app" {
   name                      = "${var.name}-app-asg"
   vpc_zone_identifier       = aws_subnet.app[*].id
@@ -44,7 +55,7 @@ resource "aws_autoscaling_group" "app" {
   desired_capacity          = 2
   max_size                  = 4
   health_check_type         = "ELB"
-  health_check_grace_period = 360
+  health_check_grace_period = 360 # time for user data to finish before checks count
   target_group_arns         = [aws_lb_target_group.app.arn]
 
   launch_template {
@@ -69,6 +80,8 @@ resource "aws_autoscaling_group" "app" {
   }
 }
 
+# ---------- Scaling policy ----------
+# Target tracking: add/remove instances to keep average CPU near 50%
 resource "aws_autoscaling_policy" "cpu" {
   name                      = "${var.name}-cpu-target-50"
   autoscaling_group_name    = aws_autoscaling_group.app.name
