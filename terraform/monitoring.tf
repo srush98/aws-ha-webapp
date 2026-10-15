@@ -19,15 +19,6 @@ resource "aws_vpc_security_group_egress_rule" "mon_https" {
   to_port           = 443
 }
 
-# Outbound HTTP: package mirrors (same as the app tier)
-resource "aws_vpc_security_group_egress_rule" "mon_http" {
-  security_group_id = aws_security_group.monitoring.id
-  cidr_ipv4         = "0.0.0.0/0"
-  ip_protocol       = "tcp"
-  from_port         = 80
-  to_port           = 80
-}
-
 # Outbound 9100 to app servers only (node_exporter)
 resource "aws_vpc_security_group_egress_rule" "mon_to_app_node" {
   security_group_id            = aws_security_group.monitoring.id
