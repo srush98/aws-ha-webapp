@@ -1,3 +1,9 @@
+# =====================================================================
+# Security groups: ALB -> app (8080) -> DB (3306)
+# Rules are separate resources so groups can reference each other
+# =====================================================================
+
+# ---------- Security groups ----------
 resource "aws_security_group" "alb" {
   name        = "${var.name}-alb-sg"
   description = "ALB - public HTTP/HTTPS"
@@ -20,6 +26,7 @@ resource "aws_security_group" "db" {
 }
 
 # ----- ALB: internet in, anything out -----
+# HTTP is accepted only to be redirected to HTTPS (see alb.tf)
 resource "aws_vpc_security_group_ingress_rule" "alb_http" {
   security_group_id = aws_security_group.alb.id
   cidr_ipv4         = "0.0.0.0/0"
@@ -39,10 +46,11 @@ resource "aws_vpc_security_group_ingress_rule" "alb_https" {
 resource "aws_vpc_security_group_egress_rule" "alb_all" {
   security_group_id = aws_security_group.alb.id
   cidr_ipv4         = "0.0.0.0/0"
-  ip_protocol       = "-1"
+  ip_protocol       = "-1" # all protocols
 }
 
 # ----- App: 8080 from ALB only; out to web + DB only -----
+# Tomcat port, reachable only from the ALB security group
 resource "aws_vpc_security_group_ingress_rule" "app_from_alb" {
   security_group_id            = aws_security_group.app.id
   referenced_security_group_id = aws_security_group.alb.id
@@ -51,6 +59,7 @@ resource "aws_vpc_security_group_ingress_rule" "app_from_alb" {
   to_port                      = 8080
 }
 
+# HTTPS out: SSM, S3, GitHub, package repos
 resource "aws_vpc_security_group_egress_rule" "app_https" {
   security_group_id = aws_security_group.app.id
   cidr_ipv4         = "0.0.0.0/0"
@@ -59,6 +68,7 @@ resource "aws_vpc_security_group_egress_rule" "app_https" {
   to_port           = 443
 }
 
+# HTTP out: package repos served over plain HTTP
 resource "aws_vpc_security_group_egress_rule" "app_http" {
   security_group_id = aws_security_group.app.id
   cidr_ipv4         = "0.0.0.0/0"
@@ -67,6 +77,7 @@ resource "aws_vpc_security_group_egress_rule" "app_http" {
   to_port           = 80
 }
 
+# MySQL out, to the DB security group only
 resource "aws_vpc_security_group_egress_rule" "app_to_db" {
   security_group_id            = aws_security_group.app.id
   referenced_security_group_id = aws_security_group.db.id

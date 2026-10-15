@@ -1,10 +1,12 @@
 # ---------- Tomcat log bucket: private, encrypted, TLS-only, 30-day expiry ----------
+# Bucket names are global, so the account ID is appended
 resource "aws_s3_bucket" "logs" {
   bucket        = "${var.name}-tomcat-logs-${data.aws_caller_identity.current.account_id}"
   force_destroy = true # lab: lets `terraform destroy` remove it with logs inside
   tags          = { Name = "${var.name}-tomcat-logs" }
 }
 
+# Block every form of public access
 resource "aws_s3_bucket_public_access_block" "logs" {
   bucket                  = aws_s3_bucket.logs.id
   block_public_acls       = true
@@ -13,6 +15,7 @@ resource "aws_s3_bucket_public_access_block" "logs" {
   restrict_public_buckets = true
 }
 
+# Encrypt objects at rest with S3-managed keys (SSE-S3)
 resource "aws_s3_bucket_server_side_encryption_configuration" "logs" {
   bucket = aws_s3_bucket.logs.id
   rule {
@@ -22,6 +25,7 @@ resource "aws_s3_bucket_server_side_encryption_configuration" "logs" {
   }
 }
 
+# Delete logs under tomcat/ after 30 days; clean up failed uploads after 1 day
 resource "aws_s3_bucket_lifecycle_configuration" "logs" {
   bucket = aws_s3_bucket.logs.id
   rule {
@@ -39,6 +43,7 @@ resource "aws_s3_bucket_lifecycle_configuration" "logs" {
   }
 }
 
+# Deny any request not made over HTTPS
 data "aws_iam_policy_document" "logs_tls_only" {
   statement {
     sid     = "DenyInsecureTransport"
@@ -57,6 +62,7 @@ data "aws_iam_policy_document" "logs_tls_only" {
   }
 }
 
+# Applied after the public access block to avoid conflicting API calls
 resource "aws_s3_bucket_policy" "logs" {
   bucket     = aws_s3_bucket.logs.id
   policy     = data.aws_iam_policy_document.logs_tls_only.json

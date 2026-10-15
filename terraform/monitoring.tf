@@ -43,11 +43,13 @@ resource "aws_iam_role" "monitoring" {
   assume_role_policy = data.aws_iam_policy_document.ec2_assume.json # reused from iam.tf
 }
 
+# Session Manager access (no SSH)
 resource "aws_iam_role_policy_attachment" "monitoring_ssm_core" {
   role       = aws_iam_role.monitoring.name
   policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
 }
 
+# Least privilege: discover app servers; read monitoring secrets (e.g. Slack webhook)
 resource "aws_iam_role_policy" "monitoring" {
   name = "${var.name}-monitoring-policy"
   role = aws_iam_role.monitoring.id
@@ -70,12 +72,14 @@ resource "aws_iam_role_policy" "monitoring" {
   })
 }
 
+# EC2 attaches roles through an instance profile
 resource "aws_iam_instance_profile" "monitoring" {
   name = "${var.name}-monitoring-ec2-profile"
   role = aws_iam_role.monitoring.name
 }
 
 # ---------- Prometheus server ----------
+# Single instance running Prometheus, Alertmanager and Blackbox exporter
 resource "aws_instance" "monitoring" {
   ami                    = data.aws_ami.al2023.id
   instance_type          = var.monitoring_instance_type

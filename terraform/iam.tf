@@ -1,3 +1,8 @@
+# =====================================================================
+# IAM: instance role for the app servers
+# =====================================================================
+
+# Current account ID, used to build ARNs (also used in logs.tf, monitoring.tf)
 data "aws_caller_identity" "current" {}
 
 # Who may assume the role: only the EC2 service
@@ -30,16 +35,19 @@ resource "aws_iam_role_policy" "app" {
     Version = "2012-10-17"
     Statement = [
       {
+        # DB connection settings from parameters.tf
         Effect   = "Allow"
         Action   = "ssm:GetParameter"
         Resource = "arn:aws:ssm:${var.region}:${data.aws_caller_identity.current.account_id}:parameter/${var.name}/db/*"
       },
       {
+        # Upload Tomcat logs; no read or delete
         Effect   = "Allow"
         Action   = "s3:PutObject"
         Resource = "${aws_s3_bucket.logs.arn}/tomcat/*"
       },
       {
+        # List only under the tomcat/ prefix
         Effect    = "Allow"
         Action    = "s3:ListBucket"
         Resource  = aws_s3_bucket.logs.arn
