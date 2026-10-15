@@ -15,3 +15,9 @@ variable "subdomain" { default = "terraform" }
 variable "node_exporter_version" { default = "1.8.2" }
 variable "monitoring_instance_type" { default = "t3.micro" }
 variable "prometheus_version" { default = "3.1.0" }
+
+variable "alertmanager_version" { default = "0.27.0" }
+variable "blackbox_version" { default = "0.25.0" }
+variable "cpu_alert_threshold" { default = 10 } # DEMO value; production = 80
+variable "disk_alert_threshold" { default = 80 }
+variable "ssl_expiry_alert_days" { default = 30 }

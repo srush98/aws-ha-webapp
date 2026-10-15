@@ -103,9 +103,15 @@ resource "aws_instance" "monitoring" {
   }
 
   user_data = templatefile("${path.module}/userdata-monitoring.sh.tftpl", {
-    region             = var.region
-    name               = var.name
-    prometheus_version = var.prometheus_version
+    region               = var.region
+    name                 = var.name
+    app_fqdn             = local.app_fqdn # from dns.tf
+    prometheus_version   = var.prometheus_version
+    alertmanager_version = var.alertmanager_version
+    blackbox_version     = var.blackbox_version
+    cpu_threshold        = var.cpu_alert_threshold
+    disk_threshold       = var.disk_alert_threshold
+    ssl_days             = var.ssl_expiry_alert_days
   })
   user_data_replace_on_change = true # config change => new server
 
