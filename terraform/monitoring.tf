@@ -83,3 +83,35 @@ resource "aws_iam_instance_profile" "monitoring" {
   name = "${var.name}-monitoring-ec2-profile"
   role = aws_iam_role.monitoring.name
 }
+
+# ---------- Prometheus server ----------
+resource "aws_instance" "monitoring" {
+  ami                    = data.aws_ami.al2023.id
+  instance_type          = var.monitoring_instance_type
+  subnet_id              = aws_subnet.app[0].id # private, has NAT
+  vpc_security_group_ids = [aws_security_group.monitoring.id]
+  iam_instance_profile   = aws_iam_instance_profile.monitoring.name
+
+  metadata_options {
+    http_tokens = "required" # IMDSv2 only
+  }
+
+  root_block_device {
+    volume_type = "gp3"
+    volume_size = 10
+    encrypted   = true
+  }
+
+  user_data = templatefile("${path.module}/userdata-monitoring.sh.tftpl", {
+    region             = var.region
+    name               = var.name
+    prometheus_version = var.prometheus_version
+  })
+  user_data_replace_on_change = true # config change => new server
+
+  lifecycle {
+    ignore_changes = [ami] # no surprise replacement on new AMIs
+  }
+
+  tags = { Name = "${var.name}-monitoring" } # NOT tf-app, or it would scrape itself
+}

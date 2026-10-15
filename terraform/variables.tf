@@ -13,3 +13,5 @@ variable "domain_name" { default = "srushti.site" }
 variable "subdomain" { default = "terraform" }
 
 variable "node_exporter_version" { default = "1.8.2" }
+variable "monitoring_instance_type" { default = "t3.micro" }
+variable "prometheus_version" { default = "3.1.0" }

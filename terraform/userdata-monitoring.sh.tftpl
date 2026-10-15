@@ -1,0 +1,77 @@
+#!/bin/bash
+set -euo pipefail   # monitoring IS this server's job: fail loudly
+
+PROM_VER="${prometheus_version}"
+PROM_URL="https://github.com/prometheus/prometheus/releases/download/v$PROM_VER"
+
+# ---- Install Prometheus (pinned, checksum-verified, unprivileged user) ----
+cd /tmp
+curl -fsSLO "$PROM_URL/prometheus-$PROM_VER.linux-amd64.tar.gz"
+curl -fsSL -o prom-sha256sums.txt "$PROM_URL/sha256sums.txt"
+sha256sum -c --ignore-missing prom-sha256sums.txt
+tar xzf "prometheus-$PROM_VER.linux-amd64.tar.gz"
+install -m 0755 "prometheus-$PROM_VER.linux-amd64/prometheus" /usr/local/bin/
+install -m 0755 "prometheus-$PROM_VER.linux-amd64/promtool"   /usr/local/bin/
+
+useradd -r -M -s /sbin/nologin prometheus
+mkdir -p /etc/prometheus /var/lib/prometheus
+chown prometheus:prometheus /var/lib/prometheus
+
+# ---- Configuration ----
+cat > /etc/prometheus/prometheus.yml <<'EOF'
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  # Prometheus monitoring itself
+  - job_name: prometheus
+    static_configs:
+      - targets: ['localhost:9090']
+
+  # App servers, found automatically via the EC2 API (follows the ASG)
+  - job_name: node
+    ec2_sd_configs:
+      - region: ${region}
+        port: 9100
+        filters:
+          - name: tag:Name
+            values: ['${name}-app']
+          - name: instance-state-name
+            values: ['running']
+    relabel_configs:
+      # Label targets by instance ID (matches the S3 log folder tomcat/<id>/)
+      - source_labels: [__meta_ec2_instance_id]
+        target_label: instance
+      - source_labels: [__meta_ec2_availability_zone]
+        target_label: az
+EOF
+promtool check config /etc/prometheus/prometheus.yml
+
+# ---- systemd service ----
+cat > /etc/systemd/system/prometheus.service <<'EOF'
+[Unit]
+Description=Prometheus
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=prometheus
+Group=prometheus
+ExecStart=/usr/local/bin/prometheus \
+  --config.file=/etc/prometheus/prometheus.yml \
+  --storage.tsdb.path=/var/lib/prometheus \
+  --storage.tsdb.retention.time=7d \
+  --web.listen-address=127.0.0.1:9090
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/prometheus
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now prometheus
