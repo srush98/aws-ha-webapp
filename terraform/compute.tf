@@ -24,11 +24,12 @@ resource "aws_launch_template" "app" {
   }
 
   user_data = base64encode(templatefile("${path.module}/userdata.sh.tftpl", {
-    repo_url   = var.repo_url
-    region     = var.region
-    prefix     = var.name
-    db_host    = aws_db_instance.main.address
-    log_bucket = aws_s3_bucket.logs.bucket
+    repo_url              = var.repo_url
+    region                = var.region
+    prefix                = var.name
+    db_host               = aws_db_instance.main.address
+    log_bucket            = aws_s3_bucket.logs.bucket
+    node_exporter_version = var.node_exporter_version
   }))
 
   tag_specifications {

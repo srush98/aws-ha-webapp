@@ -11,3 +11,5 @@ variable "repo_url" { default = "https://github.com/srush98/aws-ha-webapp.git" }
 
 variable "domain_name" { default = "srushti.site" }
 variable "subdomain" { default = "terraform" }
+
+variable "node_exporter_version" { default = "1.8.2" }
