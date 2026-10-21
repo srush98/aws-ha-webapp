@@ -22,7 +22,7 @@ A Java (JSP + MySQL) login and registration application deployed on a secure, hi
 - [Logging](#logging)
 - [Monitoring and alerting](#monitoring-and-alerting)
 - [Verifying the deployment](#verifying-the-deployment)
-- [Operations: update, roll back, tear down](#operations-update-roll-back-tear-down)
+- [Tear down](#tear-down)
 - [Security](#security)
 - [Key design decisions](#key-design-decisions)
 - [Cost](#cost)
@@ -133,19 +133,33 @@ aws-ha-webapp/
 - Terraform 1.5 or newer, the AWS CLI v2, and Git
 - The [Session Manager plugin](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html) for the AWS CLI, to open the Prometheus, Alertmanager and Grafana web UIs
 - A public Route 53 hosted zone for the domain, with the registrar's nameservers pointing to it. Terraform **reads** this zone and never creates or deletes it.
-- A Slack [incoming webhook](https://api.slack.com/messaging/webhooks), stored in Parameter Store **before** `terraform apply` (the monitoring server refuses to start without it). It is created by hand so the secret never enters Terraform code or state:
-
-  ```bash
-  aws ssm put-parameter --region us-east-1 --name /tf/monitoring/slack_webhook \
-    --type SecureString --value "https://hooks.slack.com/services/..."
-  ```
+- A Slack [incoming webhook](https://api.slack.com/messaging/webhooks) for alerts (stored in step 1 below)
 
 ## Deploying the infrastructure
 
 ```bash
 git clone https://github.com/srush98/aws-ha-webapp.git
 cd aws-ha-webapp/terraform
+```
 
+**1. Store the Slack webhook** in Parameter Store. Do this **before** `terraform apply`: the monitoring server refuses to start without it. It is created by hand so the secret never enters Terraform code or state:
+
+```bash
+read -rs SLACK_URL                  # paste the webhook, press Enter (nothing is echoed)
+printf '%s\n' "${SLACK_URL:0:12}"   # sanity check: should print https://hook
+
+MSYS_NO_PATHCONV=1 aws ssm put-parameter --region us-east-1 \
+  --name /tf/monitoring/slack_webhook --type SecureString --overwrite \
+  --value "$SLACK_URL"
+
+unset SLACK_URL
+```
+
+`MSYS_NO_PATHCONV=1` stops Git Bash on Windows from rewriting `/tf/...` into a Windows path; it is harmless on macOS and Linux.
+
+**2. Deploy:**
+
+```bash
 terraform init       # download providers
 terraform fmt        # format
 terraform validate   # check syntax
@@ -155,6 +169,24 @@ terraform output     # app_url, alb_dns_name, db_endpoint, log_bucket, monitorin
 ```
 
 After `apply`, the instances need about 5 minutes to bootstrap before the target group reports them healthy. Then open the `app_url` output.
+
+**3. Open the monitoring UIs** (optional). Nothing is exposed to the internet, so each UI is reached through a Session Manager port forward. Each command holds its tunnel open, so use one terminal per UI:
+
+```bash
+# Prometheus → http://localhost:9090
+aws ssm start-session --region us-east-1 \
+  --target $(terraform output -raw monitoring_instance_id) \
+  --document-name AWS-StartPortForwardingSession \
+  --parameters '{"portNumber":["9090"],"localPortNumber":["9090"]}'
+
+# Grafana → http://localhost:3000 (no login needed, read-only)
+aws ssm start-session --region us-east-1 \
+  --target $(terraform output -raw monitoring_instance_id) \
+  --document-name AWS-StartPortForwardingSession \
+  --parameters '{"portNumber":["3000"],"localPortNumber":["3000"]}'
+```
+
+For Alertmanager, use port `9093` in both places.
 
 To use another domain or account, change the defaults in `variables.tf` (`domain_name`, `subdomain`, `repo_url`).
 
@@ -235,26 +267,14 @@ Grafana is fully provisioned from code: the Prometheus datasource (fixed `uid: p
 
 **Adding a dashboard:** build it in Grafana, export it as JSON (*Share → Export*), make sure its panels use the `prometheus` datasource UID or a datasource variable, save it in `terraform/monitoring/dashboards/` and run `terraform apply`. Terraform uploads it and replaces the monitoring server.
 
-**Logging in:** the user is `admin`. Terraform generates the password and stores it in Parameter Store, so nobody has to type or remember it:
+**Logging in:** you don't need to. Grafana is reachable only through the Session Manager tunnel, which already requires IAM, so anonymous users get read-only **Viewer** access and the dashboards open directly. For admin tasks, sign in as `admin`. Terraform generates the password and stores it in Parameter Store:
 
 ```bash
 aws ssm get-parameter --region us-east-1 --name /tf/monitoring/grafana_admin_password \
   --with-decryption --query Parameter.Value --output text
 ```
 
-Sign-up, anonymous access, Gravatar and update checks are all disabled in `grafana.ini`.
-
-### Opening the web UIs
-
-Nothing is exposed to the internet. Forward a port through Session Manager instead:
-
-```bash
-aws ssm start-session --target $(terraform output -raw monitoring_instance_id) \
-  --document-name AWS-StartPortForwardingSession \
-  --parameters '{"portNumber":["9090"],"localPortNumber":["9090"]}'
-```
-
-Then open http://localhost:9090 (*Status → Targets* should list both app instances and the HTTPS probe as **UP**). Use port `9093` for Alertmanager and `3000` for Grafana (http://localhost:3000).
+Sign-up, Gravatar and update checks are disabled in `grafana.ini`.
 
 ### Testing an alert
 
@@ -269,7 +289,7 @@ With the demo CPU threshold, `timeout 600 yes > /dev/null` triggers `HighCpu` af
 
 ### Rotating the Slack webhook
 
-The webhook is read from Parameter Store only at first boot. After updating the parameter, replace the server:
+The webhook is read from Parameter Store only at first boot. Repeat [step 1](#deploying-the-infrastructure) with the new URL (`--overwrite` replaces the old value), then replace the server:
 
 ```bash
 terraform apply -replace=aws_instance.monitoring
@@ -281,29 +301,18 @@ terraform apply -replace=aws_instance.monitoring
 # HTTPS and redirect
 curl -sI http://terraform.srushti.site | head -3    # 301 → https://terraform.srushti.site:443/
 curl -sI https://terraform.srushti.site | head -1   # HTTP/1.1 200
-
-# Infrastructure matches the code
-terraform plan                                      # "No changes."
-```
-
-From an instance (EC2 → Connect → **Session Manager**), prove encrypted database connectivity without printing the password:
-
-```bash
-MYSQL_PWD=$(aws ssm get-parameter --region us-east-1 --name /tf/db/password \
-  --with-decryption --query Parameter.Value --output text) \
-  mysql -h <db_endpoint> -u admin --ssl jwt -e "SHOW TABLES; SHOW STATUS LIKE 'Ssl_cipher';"
 ```
 
 **High-availability test:** terminate one instance in the EC2 console. The ASG launches a replacement automatically and the site stays up throughout. The terminated instance's `tomcat/<instance-id>/` folder remains in S3 with its final log lines.
 
 **Write-only check:** from an instance, `aws s3 rm s3://<log_bucket>/tomcat/ --recursive` must fail with **AccessDenied**.
 
-**Monitoring check:** in the Prometheus UI (see [Opening the web UIs](#opening-the-web-uis)), every target under *Status → Targets* is **UP** and *Alerts* shows nothing firing. In Grafana, the **tf-webapp overview** dashboard shows every app instance up and the site status as up. On the monitoring server, `systemctl status prometheus alertmanager blackbox_exporter grafana-server` shows all four active.
+**Monitoring check:** in the Prometheus UI (see [step 3 of Deploying](#deploying-the-infrastructure)), every target under *Status → Targets* is **UP** and *Alerts* shows nothing firing. In Grafana, the **tf-webapp overview** dashboard shows every app instance up and the site status as up. On the monitoring server, `systemctl status prometheus alertmanager blackbox_exporter grafana-server` shows all four active.
 
 ## Tear down
 
 ```bash
-cd terraform && terraform destroy
+terraform destroy
 ```
 
 This removes every Terraform-managed resource, including the database (no final snapshot), the Tomcat log and monitoring config buckets and their contents (`force_destroy`), and the `terraform.srushti.site` record and certificate. The Route 53 hosted zone is only read by Terraform, so it is **not** deleted and the domain delegation stays intact.
@@ -318,7 +327,7 @@ This removes every Terraform-managed resource, including the database (no final 
 - **Tamper-resistant logging:** instances have write-only access to the log bucket, which is private and accepts TLS requests only, so a compromised server cannot read or delete past logs.
 - **IMDSv2 required** on all instances, protecting instance credentials from SSRF-style attacks.
 - **Private monitoring:** the monitoring server has no public IP and no inbound rules, and its services (including Grafana) listen on localhost only; the UIs are reached through Session Manager port forwarding. Its IAM role can describe EC2 instances, read `/tf/monitoring/*` parameters and read (not write) its config bucket, but cannot read the database secrets.
-- **Grafana:** the admin password is generated by Terraform and stored as a SecureString, then written at boot to a file readable only by the `grafana` group. Sign-up and anonymous access are disabled.
+- **Grafana:** the admin password is generated by Terraform and stored as a SecureString, then written at boot to a file readable only by the `grafana` group. Sign-up is disabled, and anonymous access is read-only (Viewer) because the IAM-authenticated tunnel is the only way in.
 - **Monitoring config bucket:** private, encrypted, versioned (a history of every config change), and TLS-only.
 - **Slack webhook:** created by hand as a SecureString (never in Terraform code or state), fetched at boot into a file readable only by the `alertmanager` user, and never written to user data.
 - **Verified downloads:** every Prometheus component is checked against its published SHA-256 checksum before installation, and the Grafana RPM against a checksum pinned in Git.
@@ -356,15 +365,13 @@ Approximately **$3.75–4.75 per day** while running (NAT Gateway about $1, ALB 
 | `InstanceRefreshInProgress` | A refresh is already running | Wait for it to finish, then start a new one |
 | Log upload fails with AccessDenied | `s3:ListBucket` missing (`sync` lists the destination before uploading) | Check the `tf-app-policy` statements in `iam.tf` |
 | No logs in the bucket yet | The first upload runs 5 minutes after boot | Wait, or run `sudo systemctl start tomcat-logs.service` on the instance |
-| No Prometheus or Alertmanager running on the monitoring server | Slack webhook parameter missing or malformed (bootstrap stops on purpose) | Create `/tf/monitoring/slack_webhook`, then `terraform apply -replace=aws_instance.monitoring`; check `/var/log/cloud-init-output.log` |
+| No Prometheus or Alertmanager running on the monitoring server | Slack webhook parameter missing or malformed (bootstrap stops on purpose) | Store it ([Deploying, step 1](#deploying-the-infrastructure)), then `terraform apply -replace=aws_instance.monitoring`; check `/var/log/cloud-init-output.log` |
 | App target **DOWN** in Prometheus | `node_exporter` failed to install, or port 9100 blocked | On the instance: `systemctl status node_exporter`; check the `app_node_from_mon` rule in `monitoring.tf` |
 | HTTPS probe **DOWN** but the site works | The monitoring server cannot reach the internet | Check the NAT Gateway and the `mon_https` egress rule |
 | Grafana port forward connects but the page does not load | `grafana-server` not running | On the monitoring server: `sudo journalctl -u grafana-server -n 30 --no-pager`; check `/var/log/cloud-init-output.log` for a checksum failure on the RPM |
 | Grafana dashboard shows "No data" or a datasource error | The dashboard JSON points at a datasource UID from another Grafana | Replace that UID with `prometheus` (or a `${ds_prometheus}`-style datasource variable), then `terraform apply` |
 | A dashboard change does not appear | The server picks up config only at boot | `terraform apply` replaces the server automatically when the JSON changes; check the plan shows `aws_instance.monitoring` being replaced |
 | Alerts fire but nothing reaches Slack | Webhook revoked or wrong | On the monitoring server: `sudo journalctl -u alertmanager -n 20 --no-pager` |
-| Parameter names wrong when created from Git Bash | Git Bash converts `/path` arguments to Windows paths | Use PowerShell, or prefix the command with `MSYS_NO_PATHCONV=1` |
-
 ## Known limitations and future improvements
 
 - **Remote state:** move Terraform state to an encrypted, versioned S3 backend with locking for team use.
