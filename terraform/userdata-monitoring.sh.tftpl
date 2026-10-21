@@ -1,4 +1,5 @@
 #!/bin/bash
+# config-hash: ${config_hash}   (changes when any config in S3 changes => new server)
 set -euo pipefail   # monitoring IS this server's job: fail loudly (and no -x: secret below)
 
 PROM_VER="${prometheus_version}"
@@ -9,8 +10,9 @@ BB_VER="${blackbox_version}"
 gh_install() {
   local proj=$1 ver=$2
   local base="https://github.com/prometheus/$proj/releases/download/v$ver"
-  curl -fsSLO "$base/$proj-$ver.linux-amd64.tar.gz"
-  curl -fsSL -o "$proj-sha256sums.txt" "$base/sha256sums.txt"
+  local opts="--retry 10 --retry-delay 15 --retry-all-errors --connect-timeout 10"
+  curl -fsSLO $opts "$base/$proj-$ver.linux-amd64.tar.gz"
+  curl -fsSL  $opts -o "$proj-sha256sums.txt" "$base/sha256sums.txt"
   sha256sum -c --ignore-missing "$proj-sha256sums.txt"
   tar xzf "$proj-$ver.linux-amd64.tar.gz"
   rm -f "$proj-$ver.linux-amd64.tar.gz"
@@ -40,144 +42,17 @@ chown root:alertmanager /etc/alertmanager/slack_webhook
 grep -q '^https://hooks.slack.com/services/' /etc/alertmanager/slack_webhook \
   || { echo "ERROR: Slack webhook in Parameter Store is malformed" >&2; exit 1; }
 
-# ---- Prometheus ----
-cat > /etc/prometheus/prometheus.yml <<'EOF'
-global:
-  scrape_interval: 15s
-  evaluation_interval: 15s
+# ---- Configuration from S3 (via the free S3 gateway endpoint, not the NAT) ----
+CFG="s3://${config_bucket}/monitoring"
+aws s3 cp --recursive --region ${region} "$CFG/prometheus/"   /etc/prometheus/
+aws s3 cp --recursive --region ${region} "$CFG/alertmanager/" /etc/alertmanager/
+aws s3 cp --recursive --region ${region} "$CFG/blackbox/"     /etc/blackbox_exporter/
 
-rule_files:
-  - /etc/prometheus/rules/*.yml
-
-alerting:
-  alertmanagers:
-    - static_configs:
-        - targets: ['127.0.0.1:9093']
-
-scrape_configs:
-  - job_name: prometheus
-    static_configs:
-      - targets: ['localhost:9090']
-
-  - job_name: node
-    ec2_sd_configs:
-      - region: ${region}
-        port: 9100
-        filters:
-          - name: tag:Name
-            values: ['${name}-app']
-          - name: instance-state-name
-            values: ['running']
-    relabel_configs:
-      - source_labels: [__meta_ec2_instance_id]
-        target_label: instance
-      - source_labels: [__meta_ec2_availability_zone]
-        target_label: az
-
-  # Probe the public site like a real user: DNS -> NAT -> internet -> ALB -> Tomcat
-  - job_name: blackbox_https
-    scrape_interval: 60s
-    metrics_path: /probe
-    params:
-      module: [https_2xx]
-    static_configs:
-      - targets: ['https://${app_fqdn}']
-    relabel_configs:
-      - source_labels: [__address__]
-        target_label: __param_target
-      - source_labels: [__param_target]
-        target_label: instance
-      - target_label: __address__
-        replacement: 127.0.0.1:9115
-EOF
-
-cat > /etc/prometheus/rules/alerts.yml <<'EOF'
-groups:
-  - name: tf-webapp
-    rules:
-      - alert: InstanceDown
-        expr: up{job="node"} == 0
-        for: 1m
-        labels:
-          severity: critical
-        annotations:
-          summary: "App instance {{ $labels.instance }} is down"
-          description: "node_exporter on {{ $labels.instance }} ({{ $labels.az }}) has not answered for 1 minute."
-
-      - alert: HighCpu
-        expr: 100 * (1 - avg by (instance, az) (rate(node_cpu_seconds_total{mode="idle"}[5m]))) > ${cpu_threshold}
-        for: 5m
-        labels:
-          severity: warning
-        annotations:
-          summary: "High CPU on {{ $labels.instance }}"
-          description: "CPU is {{ $value | humanize }}% (threshold ${cpu_threshold}%) for 5 minutes."
-
-      - alert: DiskSpaceHigh
-        expr: 100 * (1 - node_filesystem_avail_bytes{mountpoint="/"} / node_filesystem_size_bytes{mountpoint="/"}) > ${disk_threshold}
-        for: 5m
-        labels:
-          severity: warning
-        annotations:
-          summary: "Root disk filling up on {{ $labels.instance }}"
-          description: "{{ $value | humanize }}% used (threshold ${disk_threshold}%)."
-
-      - alert: SslCertExpiringSoon
-        expr: (probe_ssl_earliest_cert_expiry{job="blackbox_https"} - time()) / 86400 < ${ssl_days}
-        for: 5m
-        labels:
-          severity: warning
-        annotations:
-          summary: "TLS certificate for {{ $labels.instance }} expires soon"
-          description: "{{ $value | humanize }} days left (threshold ${ssl_days}). ACM should auto-renew: check its status."
-
-      # Companion to the SSL alert: if the probe fails, the expiry metric disappears
-      - alert: EndpointDown
-        expr: probe_success{job="blackbox_https"} == 0
-        for: 2m
-        labels:
-          severity: critical
-        annotations:
-          summary: "{{ $labels.instance }} is unreachable"
-          description: "The HTTPS probe has failed for 2 minutes (DNS, TLS, ALB or app)."
-EOF
+# ---- Validate what was downloaded: fail loudly on a bad upload ----
 promtool check config /etc/prometheus/prometheus.yml   # also validates the rule file
-
-# ---- Alertmanager ----
-cat > /etc/alertmanager/alertmanager.yml <<'EOF'
-route:
-  receiver: slack
-  group_by: ['alertname']
-  group_wait: 30s
-  group_interval: 5m
-  repeat_interval: 4h
-
-receivers:
-  - name: slack
-    slack_configs:
-      - api_url_file: /etc/alertmanager/slack_webhook
-        send_resolved: true
-        title: '{{ if eq .Status "firing" }}:rotating_light: FIRING{{ else }}:white_check_mark: RESOLVED{{ end }} - {{ .CommonLabels.alertname }}'
-        text: |-
-          {{ range .Alerts }}*{{ .Annotations.summary }}*
-          {{ .Annotations.description }}
-          {{ end }}
-EOF
 chown root:alertmanager /etc/alertmanager/alertmanager.yml
 chmod 640 /etc/alertmanager/alertmanager.yml
 amtool check-config /etc/alertmanager/alertmanager.yml
-
-# ---- Blackbox exporter ----
-cat > /etc/blackbox_exporter/blackbox.yml <<'EOF'
-modules:
-  https_2xx:
-    prober: http
-    timeout: 10s
-    http:
-      preferred_ip_protocol: ip4
-      fail_if_not_ssl: true
-      valid_status_codes: [200]
-EOF
 
 # ---- systemd services (all bound to localhost) ----
 cat > /etc/systemd/system/blackbox_exporter.service <<'EOF'
@@ -247,6 +122,28 @@ ReadWritePaths=/var/lib/prometheus
 WantedBy=multi-user.target
 EOF
 
+# ---- Grafana: pinned RPM, checksum pinned in Terraform, localhost only ----
+GF_RPM="grafana-${grafana_version}-1.x86_64.rpm"
+curl -fsSLO --retry 10 --retry-delay 15 --retry-all-errors --connect-timeout 10 \
+  "https://dl.grafana.com/oss/release/$GF_RPM"
+echo "${grafana_rpm_sha256}  $GF_RPM" | sha256sum -c -     # must match the value in Git
+dnf install -y "./$GF_RPM"
+rm -f "$GF_RPM"
+
+# Our config AFTER the RPM, so ours wins (the RPM ships its own grafana.ini)
+aws s3 cp --recursive --region ${region} "$CFG/grafana/" /etc/grafana/
+
+# Admin password: fetched at boot, readable only by the grafana group
+(umask 027; aws ssm get-parameter --region ${region} --name "/${name}/monitoring/grafana_admin_password" \
+   --with-decryption --query Parameter.Value --output text | tr -d '\n' > /etc/grafana/admin_password)
+chown root:grafana /etc/grafana/admin_password /etc/grafana/grafana.ini
+chmod 640 /etc/grafana/admin_password /etc/grafana/grafana.ini
+
+# Dashboards (JSON from S3), loaded by the provisioning file above
+mkdir -p /var/lib/grafana/dashboards
+aws s3 cp --recursive --region ${region} "$CFG/dashboards/" /var/lib/grafana/dashboards/
+chown -R grafana:grafana /var/lib/grafana/dashboards
+
 systemctl daemon-reload
-systemctl enable --now blackbox_exporter alertmanager prometheus
+systemctl enable --now blackbox_exporter alertmanager prometheus grafana-server
 cd / && rm -rf "$WORKDIR"  

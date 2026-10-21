@@ -18,7 +18,7 @@ variable "subdomain" { default = "terraform" }
 
 # ---------- Monitoring: component versions ----------
 variable "node_exporter_version" { default = "1.8.2" } # installed on app servers
-variable "monitoring_instance_type" { default = "t3.micro" }
+variable "monitoring_instance_type" { default = "t3.small" }
 variable "prometheus_version" { default = "3.1.0" }
 
 variable "alertmanager_version" { default = "0.27.0" }
@@ -28,3 +28,7 @@ variable "blackbox_version" { default = "0.25.0" }
 variable "cpu_alert_threshold" { default = 10 }  # DEMO value; production = 80
 variable "disk_alert_threshold" { default = 80 } # percent used
 variable "ssl_expiry_alert_days" { default = 30 }
+
+
+variable "grafana_version" { default = "11.3.0" }
+variable "grafana_rpm_sha256" { default = "0b799e556c8f6f2d0e3185420ec4fd4b7cb2693d29ab2f4bf9f8c37d9bb7b28c" } # pinned in code
