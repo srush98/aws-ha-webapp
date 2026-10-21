@@ -1,15 +1,17 @@
+# Alertmanager: every alert goes to Slack
 route:
   receiver: slack
-  group_by: ['alertname']
-  group_wait: 30s
-  group_interval: 5m
-  repeat_interval: 4h
+  group_by: ['alertname']   # one message per alert type, not per instance
+  group_wait: 30s           # wait for related alerts before the first message
+  group_interval: 5m        # batch new alerts in an existing group
+  repeat_interval: 4h       # reminder while an alert keeps firing
 
 receivers:
   - name: slack
     slack_configs:
+      # Webhook written at boot from SSM: the secret is never in config or S3
       - api_url_file: /etc/alertmanager/slack_webhook
-        send_resolved: true
+        send_resolved: true   # also post when the alert clears
         title: '{{ if eq .Status "firing" }}:rotating_light: FIRING{{ else }}:white_check_mark: RESOLVED{{ end }} - {{ .CommonLabels.alertname }}'
         text: |-
           {{ range .Alerts }}*{{ .Annotations.summary }}*

@@ -1,6 +1,9 @@
+# Alert rules. Thresholds are Terraform variables; {{ }} is Prometheus templating, untouched by Terraform.
+# "for:" requires the condition to hold that long, so short blips don't page.
 groups:
   - name: tf-webapp
     rules:
+      # App server stopped answering scrapes (crashed, stopped, or network issue)
       - alert: InstanceDown
         expr: up{job="node"} == 0
         for: 1m
@@ -10,6 +13,7 @@ groups:
           summary: "App instance {{ $labels.instance }} is down"
           description: "node_exporter on {{ $labels.instance }} ({{ $labels.az }}) has not answered for 1 minute."
 
+      # CPU busy % = 100 - idle %, averaged over all cores
       - alert: HighCpu
         expr: 100 * (1 - avg by (instance, az) (rate(node_cpu_seconds_total{mode="idle"}[5m]))) > ${cpu_threshold}
         for: 5m
@@ -19,6 +23,7 @@ groups:
           summary: "High CPU on {{ $labels.instance }}"
           description: "CPU is {{ $value | humanize }}% (threshold ${cpu_threshold}%) for 5 minutes."
 
+      # Root filesystem usage %
       - alert: DiskSpaceHigh
         expr: 100 * (1 - node_filesystem_avail_bytes{mountpoint="/"} / node_filesystem_size_bytes{mountpoint="/"}) > ${disk_threshold}
         for: 5m
@@ -28,6 +33,7 @@ groups:
           summary: "Root disk filling up on {{ $labels.instance }}"
           description: "{{ $value | humanize }}% used (threshold ${disk_threshold}%)."
 
+      # Days until the site's TLS certificate expires
       - alert: SslCertExpiringSoon
         expr: (probe_ssl_earliest_cert_expiry{job="blackbox_https"} - time()) / 86400 < ${ssl_days}
         for: 5m

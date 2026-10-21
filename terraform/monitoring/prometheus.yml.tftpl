@@ -1,20 +1,25 @@
+# Prometheus config, rendered by Terraform templatefile() and uploaded to the config bucket
 global:
   scrape_interval: 15s
   evaluation_interval: 15s
 
+# Alert rules (rendered from alerts.yml.tftpl)
 rule_files:
   - /etc/prometheus/rules/*.yml
 
+# Alertmanager runs on this same server, loopback only
 alerting:
   alertmanagers:
     - static_configs:
         - targets: ['127.0.0.1:9093']
 
 scrape_configs:
+  # Prometheus monitors itself
   - job_name: prometheus
     static_configs:
       - targets: ['localhost:9090']
 
+  # App servers found via EC2 API: new ASG instances are picked up automatically
   - job_name: node
     ec2_sd_configs:
       - region: ${region}
@@ -24,6 +29,7 @@ scrape_configs:
             values: ['${name}-app']
           - name: instance-state-name
             values: ['running']
+    # Label by instance ID and AZ instead of private IP: stable and readable
     relabel_configs:
       - source_labels: [__meta_ec2_instance_id]
         target_label: instance
@@ -38,6 +44,8 @@ scrape_configs:
       module: [https_2xx]
     static_configs:
       - targets: ['https://${app_fqdn}']
+    # Standard blackbox pattern: pass the URL as ?target=, keep it as the instance label,
+    # then actually scrape the local blackbox exporter
     relabel_configs:
       - source_labels: [__address__]
         target_label: __param_target

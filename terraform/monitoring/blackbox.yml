@@ -1,8 +1,9 @@
+# Blackbox exporter: probe module used by the blackbox_https scrape job
 modules:
   https_2xx:
     prober: http
     timeout: 10s
     http:
-      preferred_ip_protocol: ip4
-      fail_if_not_ssl: true
-      valid_status_codes: [200]
+      preferred_ip_protocol: ip4   # VPC and NAT path are IPv4 only
+      fail_if_not_ssl: true        # plain HTTP counts as a failure
+      valid_status_codes: [200]    # redirects and errors count as down

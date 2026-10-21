@@ -1,9 +1,10 @@
+# Grafana provisioning: load every dashboard JSON synced from S3 at boot
 apiVersion: 1
 providers:
   - name: tf-dashboards
     folder: tf-monitoring
     type: file
-    disableDeletion: true
+    disableDeletion: true        # cannot be deleted from the UI
     allowUiUpdates: false        # code is the source of truth
     options:
       path: /var/lib/grafana/dashboards

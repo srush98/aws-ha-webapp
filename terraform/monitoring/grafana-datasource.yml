@@ -1,9 +1,10 @@
+# Grafana provisioning: the local Prometheus as the default datasource
 apiVersion: 1
 datasources:
   - name: Prometheus
     type: prometheus
     uid: prometheus            # fixed ID: dashboards survive server replacement
-    access: proxy
+    access: proxy              # Grafana server queries Prometheus, not the browser
     url: http://127.0.0.1:9090
     isDefault: true
     editable: false            # code is the source of truth

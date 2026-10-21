@@ -1,6 +1,6 @@
 # Highly Available Web Application on AWS
 
-A Java (JSP + MySQL) login and registration application deployed on a secure, highly available AWS architecture. The entire infrastructure (66 resources) is defined in **Terraform**: networking, security, database, secrets, IAM, compute, load balancing, DNS, TLS certificates, centralised log storage and monitoring. Tomcat logs from every instance are shipped to Amazon S3 so they survive instance replacement, and a private Prometheus server watches the instances and the public site, sending alerts to Slack.
+A Java (JSP + MySQL) login and registration application deployed on a secure, highly available AWS architecture. The entire infrastructure (83 resources) is defined in **Terraform**: networking, security, database, secrets, IAM, compute, load balancing, DNS, TLS certificates, centralised log storage and monitoring. Tomcat logs from every instance are shipped to Amazon S3 so they survive instance replacement, and a private Prometheus server watches the instances and the public site, sending alerts to Slack and showing everything on Grafana dashboards that are defined in code.
 
 | | |
 |---|---|
@@ -33,20 +33,48 @@ A Java (JSP + MySQL) login and registration application deployed on a secure, hi
 
 ## Architecture
 
+The application stack is spread across two Availability Zones. Every tier except the load balancer and NAT Gateway sits in private subnets. The full diagram is at the top of this page.
+
+### Request and data flows
+
 **Request flow:** User → GoDaddy (registrar, NS delegated) → Amazon Route 53 → Application Load Balancer with an ACM certificate → EC2 instances in an Auto Scaling Group → Amazon RDS MySQL
 
 **Logging flow:** every EC2 instance → `aws s3 sync` every 5 minutes (and once at shutdown) → S3 gateway endpoint → `s3://tf-tomcat-logs-<account-id>/tomcat/<instance-id>/` → deleted after 30 days
 
-**Monitoring flow:** Prometheus server → scrapes `node_exporter` on every app instance (port 9100, found by EC2 tag) and probes `https://terraform.srushti.site` through the Blackbox exporter → Alertmanager → Slack
+**Secrets flow:** Terraform generates the database password → SSM Parameter Store (SecureString) → read by the instance role at boot → passed to Tomcat as an environment variable
+
+**Scaling:** the Auto Scaling Group keeps 2–4 instances (2 by default, one per AZ) and adds or removes instances to hold average CPU at 50% (target tracking with CloudWatch alarms). Failed instances are replaced automatically after failing ALB health checks.
+
+### Network layout
 
 | Layer | What runs there |
 |---|---|
 | **Public subnets** (`10.1.1.0/24`, `10.1.2.0/24`) | Application Load Balancer, NAT Gateway |
-| **Private app subnets** (`10.1.11.0/24`, `10.1.12.0/24`) | EC2 instances (Tomcat 9 on port 8080, `node_exporter` on 9100) in an Auto Scaling Group, 2–4 instances; one Prometheus monitoring server |
+| **Private app subnets** (`10.1.11.0/24`, `10.1.12.0/24`) | EC2 instances (Tomcat 9 on port 8080, `node_exporter` on 9100) in an Auto Scaling Group, 2–4 instances; one monitoring server (Prometheus, Alertmanager, Blackbox exporter, Grafana) |
 | **Private DB subnets** (`10.1.21.0/24`, `10.1.22.0/24`) | RDS MySQL 8.4, encrypted, no internet route |
 | **Regional services** | Route 53, ACM, SSM Parameter Store, Session Manager, CloudWatch, IAM, and an S3 log bucket reached through a free gateway endpoint |
 
 Security groups form a chain: **internet → `alb-sg` (80/443) → `app-sg` (8080 from ALB only) → `db-sg` (3306 from app only)**. The monitoring server's `monitoring-sg` accepts no inbound traffic; `app-sg` accepts port 9100 from it only. No SSH port is open anywhere.
+
+### Monitoring architecture
+
+![Monitoring architecture diagram](docs/monitoring_architecture.png)
+
+A single monitoring server, `tf-monitoring`, runs in a private app subnet. It has no inbound ports, and all four services on it listen on `127.0.0.1` only.
+
+**Metrics flow:** Prometheus → EC2 API (finds instances tagged `tf-app`) → scrapes `node_exporter` on each app instance (port 9100)
+
+**Probe flow:** Blackbox exporter → NAT Gateway → internet → `https://terraform.srushti.site` → ALB → Tomcat. The probe takes the same path a real user does.
+
+**Alert flow:** Prometheus rules → Alertmanager → Slack webhook (HTTPS through the NAT Gateway) → `#aws-alerts`, with FIRING and RESOLVED messages
+
+**Dashboard flow:** Grafana → queries Prometheus on localhost → the three provisioned dashboards
+
+**Config flow:** files in `terraform/monitoring/` → rendered by Terraform → private, versioned S3 config bucket → copied onto the server at boot through the S3 gateway endpoint
+
+**Admin access:** your laptop → Session Manager port forward → `localhost:3000` (Grafana), `9090` (Prometheus) or `9093` (Alertmanager). The Slack webhook and the Grafana admin password come from Parameter Store at boot.
+
+Details are in [Monitoring and alerting](#monitoring-and-alerting).
 
 > The same architecture was first built manually in the AWS console (served at https://srushti.site, VPC `10.0.0.0/16`) to understand each component. This repository contains the Infrastructure-as-Code version, which runs side by side under the `tf-` prefix.
 
@@ -57,7 +85,7 @@ Security groups form a chain: **internet → `alb-sg` (80/443) → `app-sg` (808
 | Application | Java 17 (Amazon Corretto), JSP, Apache Tomcat 9, Maven, MySQL Connector/J 8.4 |
 | Infrastructure | Terraform ≥ 1.5, AWS provider 6.x, random provider |
 | AWS | VPC, EC2, Auto Scaling, ALB, RDS (MySQL 8.4), Route 53, ACM, S3, SSM Parameter Store and Session Manager, IAM, CloudWatch |
-| Monitoring | Prometheus 3.1, Alertmanager 0.27, Blackbox exporter 0.25, node_exporter 1.8, Slack |
+| Monitoring | Prometheus 3.1, Alertmanager 0.27, Blackbox exporter 0.25, node_exporter 1.8, Grafana 11.3, Slack |
 | DNS | GoDaddy (registrar) delegated to Route 53 |
 
 ## Repository structure
@@ -67,7 +95,8 @@ aws-ha-webapp/
 ├── db/
 │   └── schema.sql            # idempotent schema, applied automatically at boot
 ├── docs/
-│   └── architecture.png
+│   ├── architecture.png              # application architecture
+│   └── monitoring_architecture.png   # monitoring architecture
 ├── src/main/webapp/          # JSP application (credentials read from environment)
 ├── terraform/
 │   ├── providers.tf          # Terraform/provider versions, default tags
@@ -82,8 +111,17 @@ aws-ha-webapp/
 │   ├── userdata.sh.tftpl     # app instance bootstrap script (template)
 │   ├── dns.tf                # ACM certificate, DNS validation, HTTPS listener, alias
 │   ├── logs.tf               # Tomcat log bucket: private, encrypted, TLS-only, 30-day expiry
-│   ├── monitoring.tf         # Prometheus server: security group, IAM role, EC2 instance
-│   ├── userdata-monitoring.sh.tftpl  # installs Prometheus, Alertmanager, Blackbox exporter
+│   ├── monitoring.tf         # monitoring server, IAM role, config bucket, Grafana password
+│   ├── userdata-monitoring.sh.tftpl  # installs Prometheus, Alertmanager, Blackbox exporter, Grafana
+│   ├── monitoring/
+│   │   ├── prometheus.yml.tftpl      # scrape jobs (EC2 discovery, HTTPS probe)
+│   │   ├── alerts.yml.tftpl          # alert rules; thresholds come from variables.tf
+│   │   ├── alertmanager.yml          # Slack routing
+│   │   ├── blackbox.yml              # HTTPS probe module
+│   │   ├── grafana.ini               # Grafana hardening (localhost, no sign-up)
+│   │   ├── grafana-datasource.yml    # provisioned Prometheus datasource
+│   │   ├── grafana-dashboards.yml    # loads every dashboard below
+│   │   └── dashboards/               # one *.json per dashboard
 │   └── outputs.tf
 ├── pom.xml
 └── README.md
@@ -93,7 +131,7 @@ aws-ha-webapp/
 
 - An AWS account and an IAM user (not root) with administrator access, configured with `aws configure`
 - Terraform 1.5 or newer, the AWS CLI v2, and Git
-- The [Session Manager plugin](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html) for the AWS CLI, to open the Prometheus and Alertmanager web UIs
+- The [Session Manager plugin](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html) for the AWS CLI, to open the Prometheus, Alertmanager and Grafana web UIs
 - A public Route 53 hosted zone for the domain, with the registrar's nameservers pointing to it. Terraform **reads** this zone and never creates or deletes it.
 - A Slack [incoming webhook](https://api.slack.com/messaging/webhooks), stored in Parameter Store **before** `terraform apply` (the monitoring server refuses to start without it). It is created by hand so the secret never enters Terraform code or state:
 
@@ -111,7 +149,7 @@ cd aws-ha-webapp/terraform
 terraform init       # download providers
 terraform fmt        # format
 terraform validate   # check syntax
-terraform plan       # review: 66 resources to add on a fresh account
+terraform plan       # review: 83 resources to add on a fresh account
 terraform apply      # about 15 minutes (RDS is the slowest)
 terraform output     # app_url, alb_dns_name, db_endpoint, log_bucket, monitoring_instance_id, ...
 ```
@@ -157,7 +195,7 @@ sudo journalctl -u tomcat-logs.service -n 5 --no-pager
 
 ## Monitoring and alerting
 
-A single `t3.micro` (`tf-monitoring`) in a private app subnet runs Prometheus, Alertmanager and the Blackbox exporter. `userdata-monitoring.sh.tftpl` downloads each release from GitHub, verifies its SHA-256 checksum, validates the configuration (`promtool`, `amtool`) and starts everything as hardened systemd services listening on `127.0.0.1` only.
+A single `t3.small` (`tf-monitoring`) in a private app subnet runs Prometheus, Alertmanager, the Blackbox exporter and Grafana. `userdata-monitoring.sh.tftpl` downloads each Prometheus release from GitHub and verifies it against the published SHA-256 checksums. It installs the Grafana RPM only if it matches the checksum pinned in `variables.tf`. It then validates the configuration (`promtool`, `amtool`) and starts everything as systemd services listening on `127.0.0.1` only.
 
 | Component | Port | Job |
 |---|---|---|
@@ -165,8 +203,11 @@ A single `t3.micro` (`tf-monitoring`) in a private app subnet runs Prometheus, A
 | **Prometheus** | 9090 | Scrapes every 15 s; keeps 7 days of data |
 | **Blackbox exporter** | 9115 | Probes `https://terraform.srushti.site` every 60 s, like a real user (DNS → NAT → internet → ALB → Tomcat) |
 | **Alertmanager** | 9093 | Groups alerts by name and posts them to Slack, including a message when they resolve |
+| **Grafana** | 3000 | Dashboards on top of Prometheus |
 
 **Service discovery:** Prometheus finds app instances through the EC2 API (`ec2:DescribeInstances`), filtered by the tag `Name = tf-app` and state `running`. Instances launched or replaced by the Auto Scaling Group are picked up automatically; no configuration changes are needed. The monitoring server is tagged `tf-monitoring` so it does not scrape itself.
+
+**Configuration as code:** every config file lives in [`terraform/monitoring/`](terraform/monitoring/). Terraform renders the templates (thresholds, region, domain), uploads the results to a private bucket `tf-monitoring-config-<account-id>` (encrypted, versioned, TLS-only), and the server copies them down at boot through the S3 gateway endpoint. A hash of every uploaded file is part of the server's user data, so changing any config file or dashboard replaces the server on the next `terraform apply`. The server's role can only read the `monitoring/` prefix of that bucket.
 
 ### Alerts
 
@@ -182,6 +223,27 @@ A single `t3.micro` (`tf-monitoring`) in a private app subnet runs Prometheus, A
 
 Thresholds and versions are variables in `variables.tf`. Changing any of them changes the monitoring server's user data, so `terraform apply` replaces the server (`user_data_replace_on_change`). Metric history is lost when that happens.
 
+### Grafana dashboards
+
+Grafana is fully provisioned from code: the Prometheus datasource (fixed `uid: prometheus`) and every `*.json` file in [`terraform/monitoring/dashboards/`](terraform/monitoring/dashboards/) appear in the **tf-monitoring** folder. Dashboards cannot be edited or deleted in the UI, so Git is the only source of truth.
+
+| Dashboard | Source | Shows |
+|---|---|---|
+| **tf-webapp overview** | Built for this project (`tf-webapp-overview.json`) | App instances up, site status, SSL days left, alerts firing and pending, CPU % and root disk % per instance, site response time |
+| **Node Exporter Full** | Community dashboard [1860](https://grafana.com/grafana/dashboards/1860) | Detailed per-instance CPU, memory, disk and network |
+| **Blackbox Exporter (HTTP prober)** | Community dashboard [13659](https://grafana.com/grafana/dashboards/13659) | HTTPS probe status, duration and per-phase timing |
+
+**Adding a dashboard:** build it in Grafana, export it as JSON (*Share → Export*), make sure its panels use the `prometheus` datasource UID or a datasource variable, save it in `terraform/monitoring/dashboards/` and run `terraform apply`. Terraform uploads it and replaces the monitoring server.
+
+**Logging in:** the user is `admin`. Terraform generates the password and stores it in Parameter Store, so nobody has to type or remember it:
+
+```bash
+aws ssm get-parameter --region us-east-1 --name /tf/monitoring/grafana_admin_password \
+  --with-decryption --query Parameter.Value --output text
+```
+
+Sign-up, anonymous access, Gravatar and update checks are all disabled in `grafana.ini`.
+
 ### Opening the web UIs
 
 Nothing is exposed to the internet. Forward a port through Session Manager instead:
@@ -192,7 +254,7 @@ aws ssm start-session --target $(terraform output -raw monitoring_instance_id) \
   --parameters '{"portNumber":["9090"],"localPortNumber":["9090"]}'
 ```
 
-Then open http://localhost:9090 (*Status → Targets* should list both app instances and the HTTPS probe as **UP**). Use port `9093` for Alertmanager.
+Then open http://localhost:9090 (*Status → Targets* should list both app instances and the HTTPS probe as **UP**). Use port `9093` for Alertmanager and `3000` for Grafana (http://localhost:3000).
 
 ### Testing an alert
 
@@ -222,10 +284,6 @@ curl -sI https://terraform.srushti.site | head -1   # HTTP/1.1 200
 
 # Infrastructure matches the code
 terraform plan                                      # "No changes."
-
-# Database is private and available
-aws rds describe-db-instances --db-instance-identifier tf-db \
-  --query "DBInstances[0].[DBInstanceStatus,PubliclyAccessible]"
 ```
 
 From an instance (EC2 → Connect → **Session Manager**), prove encrypted database connectivity without printing the password:
@@ -240,32 +298,15 @@ MYSQL_PWD=$(aws ssm get-parameter --region us-east-1 --name /tf/db/password \
 
 **Write-only check:** from an instance, `aws s3 rm s3://<log_bucket>/tomcat/ --recursive` must fail with **AccessDenied**.
 
-**Monitoring check:** in the Prometheus UI (see [Opening the web UIs](#opening-the-web-uis)), every target under *Status → Targets* is **UP** and *Alerts* shows nothing firing. On the monitoring server, `systemctl status prometheus alertmanager blackbox_exporter` shows all three active.
+**Monitoring check:** in the Prometheus UI (see [Opening the web UIs](#opening-the-web-uis)), every target under *Status → Targets* is **UP** and *Alerts* shows nothing firing. In Grafana, the **tf-webapp overview** dashboard shows every app instance up and the site status as up. On the monitoring server, `systemctl status prometheus alertmanager blackbox_exporter grafana-server` shows all four active.
 
-## Operations: update, roll back, tear down
-
-**Update the application:** push the change to `main`, then roll it out with zero downtime. New instances clone the latest code at boot, pass their health checks, and replace the old ones one at a time while at least 100% of capacity stays healthy:
-
-```bash
-aws autoscaling start-instance-refresh --auto-scaling-group-name tf-app-asg
-```
-
-Watch progress in *EC2 → Auto Scaling groups → tf-app-asg → Instance refresh*. Changes to the launch template in Terraform (for example the bootstrap script) trigger the same rolling refresh automatically on `terraform apply`.
-
-**Roll back:** revert the commit, push, and start another instance refresh.
-
-```bash
-git revert HEAD && git push
-aws autoscaling start-instance-refresh --auto-scaling-group-name tf-app-asg
-```
-
-**Tear down:**
+## Tear down
 
 ```bash
 cd terraform && terraform destroy
 ```
 
-This removes every Terraform-managed resource, including the database (no final snapshot), the Tomcat log bucket and its contents (`force_destroy`), and the `terraform.srushti.site` record and certificate. The Route 53 hosted zone is only read by Terraform, so it is **not** deleted and the domain delegation stays intact.
+This removes every Terraform-managed resource, including the database (no final snapshot), the Tomcat log and monitoring config buckets and their contents (`force_destroy`), and the `terraform.srushti.site` record and certificate. The Route 53 hosted zone is only read by Terraform, so it is **not** deleted and the domain delegation stays intact.
 
 ## Security
 
@@ -276,11 +317,13 @@ This removes every Terraform-managed resource, including the database (no final 
 - **Encryption:** HTTPS with TLS 1.2/1.3 at the ALB (ACM certificate); TLS between the application and MySQL (`sslMode=REQUIRED`); RDS storage encrypted with KMS; log bucket encrypted with SSE-S3.
 - **Tamper-resistant logging:** instances have write-only access to the log bucket, which is private and accepts TLS requests only, so a compromised server cannot read or delete past logs.
 - **IMDSv2 required** on all instances, protecting instance credentials from SSRF-style attacks.
-- **Private monitoring:** the Prometheus server has no public IP and no inbound rules, and its services listen on localhost only; the UIs are reached through Session Manager port forwarding. Its IAM role can describe EC2 instances and read `/tf/monitoring/*` parameters, but not the database secrets.
+- **Private monitoring:** the monitoring server has no public IP and no inbound rules, and its services (including Grafana) listen on localhost only; the UIs are reached through Session Manager port forwarding. Its IAM role can describe EC2 instances, read `/tf/monitoring/*` parameters and read (not write) its config bucket, but cannot read the database secrets.
+- **Grafana:** the admin password is generated by Terraform and stored as a SecureString, then written at boot to a file readable only by the `grafana` group. Sign-up and anonymous access are disabled.
+- **Monitoring config bucket:** private, encrypted, versioned (a history of every config change), and TLS-only.
 - **Slack webhook:** created by hand as a SecureString (never in Terraform code or state), fetched at boot into a file readable only by the `alertmanager` user, and never written to user data.
-- **Verified downloads:** every Prometheus component is checked against its published SHA-256 checksum before installation.
+- **Verified downloads:** every Prometheus component is checked against its published SHA-256 checksum before installation, and the Grafana RPM against a checksum pinned in Git.
 - **Application fixes:** SQL injection removed with `PreparedStatement`, and hard-coded credentials removed.
-- **Terraform state contains secrets** (the generated password), so it is excluded from Git by `.gitignore` and backed up privately.
+- **Terraform state contains secrets** (the generated database and Grafana passwords), so it is excluded from Git by `.gitignore` and backed up privately.
 
 ## Key design decisions
 
@@ -293,13 +336,15 @@ This removes every Terraform-managed resource, including the database (no final 
 | Server access | Session Manager | No open ports or keys | Bastion host with SSH |
 | Logging | Tomcat logs to S3 every 5 min | Logs survive instance replacement; no agent; free upload path through the gateway endpoint; 30-day expiry | CloudWatch agent and CloudWatch Logs (real-time and searchable, more setup) |
 | Monitoring | Self-hosted Prometheus + Alertmanager → Slack | Industry-standard open-source stack; EC2 service discovery follows Auto Scaling; outside-in HTTPS probe; Slack alerts with resolve messages | CloudWatch alarms + SNS (no server to run, less flexible), Amazon Managed Service for Prometheus |
+| Dashboards | Grafana provisioned from Git (read-only in the UI) | Dashboards are reviewed and versioned like code, and they come back identical when the server is replaced | Building dashboards by hand in the UI (lost when the server is replaced) |
+| Monitoring config | Rendered by Terraform, delivered through S3 | Keeps user data small and readable; versioned bucket; any change rolls out as a fresh server | Embedding all config in user data (16 KB limit, hard to read) |
 | Updates | Rolling instance refresh | Fresh servers from the launch template; same path as scaling and self-healing; no drift | Patching servers in place (servers drift apart) |
 | Health check | Shallow (`/`) | Avoids taking every server out during a database blip | Deep check that queries the database |
 | DNS zone | Terraform `data` source | Terraform cannot accidentally delete or recreate the zone | Terraform-managed zone (nameservers would change) |
 
 ## Cost
 
-Approximately **$3.50–4.50 per day** while running (NAT Gateway about $1, ALB about $0.55, three t3.micro instances (two app servers and the monitoring server), db.t3.micro, public IPv4 addresses, and a Route 53 hosted zone at $0.50/month). ACM certificates, IAM, the S3 gateway endpoint and Session Manager are free, and storing a few MB of logs for 30 days costs fractions of a cent. Run `terraform destroy` when the environment is not needed.
+Approximately **$3.75–4.75 per day** while running (NAT Gateway about $1, ALB about $0.55, two t3.micro app servers, a t3.small monitoring server (about $0.50; Grafana needs the extra memory), db.t3.micro, public IPv4 addresses, and a Route 53 hosted zone at $0.50/month). ACM certificates, IAM, the S3 gateway endpoint and Session Manager are free, and storing a few MB of logs for 30 days costs fractions of a cent. Run `terraform destroy` when the environment is not needed.
 
 ## Troubleshooting
 
@@ -314,6 +359,9 @@ Approximately **$3.50–4.50 per day** while running (NAT Gateway about $1, ALB 
 | No Prometheus or Alertmanager running on the monitoring server | Slack webhook parameter missing or malformed (bootstrap stops on purpose) | Create `/tf/monitoring/slack_webhook`, then `terraform apply -replace=aws_instance.monitoring`; check `/var/log/cloud-init-output.log` |
 | App target **DOWN** in Prometheus | `node_exporter` failed to install, or port 9100 blocked | On the instance: `systemctl status node_exporter`; check the `app_node_from_mon` rule in `monitoring.tf` |
 | HTTPS probe **DOWN** but the site works | The monitoring server cannot reach the internet | Check the NAT Gateway and the `mon_https` egress rule |
+| Grafana port forward connects but the page does not load | `grafana-server` not running | On the monitoring server: `sudo journalctl -u grafana-server -n 30 --no-pager`; check `/var/log/cloud-init-output.log` for a checksum failure on the RPM |
+| Grafana dashboard shows "No data" or a datasource error | The dashboard JSON points at a datasource UID from another Grafana | Replace that UID with `prometheus` (or a `${ds_prometheus}`-style datasource variable), then `terraform apply` |
+| A dashboard change does not appear | The server picks up config only at boot | `terraform apply` replaces the server automatically when the JSON changes; check the plan shows `aws_instance.monitoring` being replaced |
 | Alerts fire but nothing reaches Slack | Webhook revoked or wrong | On the monitoring server: `sudo journalctl -u alertmanager -n 20 --no-pager` |
 | Parameter names wrong when created from Git Bash | Git Bash converts `/path` arguments to Windows paths | Use PowerShell, or prefix the command with `MSYS_NO_PATHCONV=1` |
 
@@ -325,5 +373,5 @@ Approximately **$3.50–4.50 per day** while running (NAT Gateway about $1, ALB 
 - **Password hashing:** the application stores user passwords in plain text; hash them (e.g. bcrypt).
 - **Faster scale-out:** ship a pre-built WAR or a golden AMI so new instances do not compile the app at boot.
 - **Edge security:** add AWS WAF to the ALB.
-- **Monitoring:** add Grafana dashboards; keep metrics on a separate EBS volume (or use Amazon Managed Service for Prometheus) so they survive server replacement; monitor RDS and the ALB too (CloudWatch exporter); the monitoring server is a single instance, so a watchdog such as a CloudWatch status-check alarm would catch it going down.
+- **Monitoring:** keep metrics on a separate EBS volume (or use Amazon Managed Service for Prometheus) so they survive server replacement; monitor RDS and the ALB too (CloudWatch exporter); the monitoring server is a single instance, so a watchdog such as a CloudWatch status-check alarm would catch it going down.
 - **Logging:** an ASG lifecycle hook to guarantee the final log upload; CloudWatch Logs for real-time search; S3 versioning or Object Lock to make logs tamper-proof.
